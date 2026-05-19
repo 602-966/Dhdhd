@@ -7,115 +7,105 @@ import time
 from datetime import datetime
 from streamlit_autorefresh import st_autorefresh
 
-# --- 1. MOBILE OPTIMIZED SETUP ---
-st.set_page_config(layout="wide", page_title="Omni-Elite V3.7 Pro")
+# --- 1. CONFIGURATION ---
+st.set_page_config(layout="wide", page_title="Omni-Elite V4.0")
 
-# Secrets Check
+# Verify NVIDIA API Key is set in Streamlit Secrets
 if "NVIDIA_API_KEY" not in st.secrets:
-    st.error("Missing NVIDIA_API_KEY in Streamlit Settings!")
+    st.error("Please add NVIDIA_API_KEY to your Streamlit secrets.")
     st.stop()
 
 NV_KEY = st.secrets["NVIDIA_API_KEY"]
 PAIRS = ["EURUSDT", "GBPUSDT", "USDJPY", "AUDUSDT", "USDCAD", "USDCHF", "EURJPY", "GBPJPY"]
 
-# Memory for signals and pair rotation
+# Session state initialization
 if 'signals' not in st.session_state: st.session_state.signals = []
 if 'pair_index' not in st.session_state: st.session_state.pair_index = 0
 if 'last_shift' not in st.session_state: st.session_state.last_shift = time.time()
 
-# AUTO-REFRESH: Keep the market moving every 5 seconds
+# Refresh data every 5 seconds
 st_autorefresh(interval=5000, key="datarefresh")
 
-# --- 2. THE CACHED DATA ENGINE (Method 2: Caching) ---
-@st.cache_data(ttl=4) # Keeps data for 4 seconds to save battery/data
-def get_live_market_data(symbol):
+# --- 2. DATA ENGINE ---
+@st.cache_data(ttl=4)
+def fetch_market_data(symbol):
+    """Fetches live market data from Binance with error handling."""
     try:
-        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=40"
-        res = requests.get(url, timeout=5).json()
-        if not isinstance(res, list) or len(res) < 5: return None
+        url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval=1m&limit=50"
+        response = requests.get(url, timeout=10)
+        response.raise_for_status()
+        data = response.json()
         
-        df = pd.DataFrame(res, columns=['t','o','h','l','c','v','ct','q','n','tb','tq','i'])
-        for col in ['o','h','l','c']: 
+        if not isinstance(data, list) or len(data) < 10:
+            return None
+            
+        df = pd.DataFrame(data, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct', 'q', 'n', 'tb', 'tq', 'i'])
+        for col in ['o', 'h', 'l', 'c']:
             df[col] = pd.to_numeric(df[col], errors='coerce')
         
         df['time'] = pd.to_datetime(df['t'], unit='ms')
         return df.dropna(subset=['c'])
-    except:
+    except Exception:
         return None
 
-# --- 3. LOGIC: STABILITY & SCANNING ---
-target_pair = PAIRS[st.session_state.pair_index]
+# --- 3. ANALYSIS & SIGNALS ---
+def get_prediction(df, symbol):
+    """Sends current market data to AI for prediction."""
+    if df is None or len(df) < 5:
+        return None
+        
+    try:
+        last_price = df['c'].iloc[-1]
+        prompt = f"Analyze {symbol} at {last_price}. Provide a trade signal: CALL or PUT if 90% confident. Include the entry time (HH:MM:SS)."
+        headers = {"Authorization": f"Bearer {NV_KEY}", "Content-Type": "application/json"}
+        payload = {
+            "model": "meta/llama-3.1-70b-instruct",
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.1
+        }
+        
+        response = requests.post("https://integrate.api.nvidia.com/v1/chat/completions", headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        return response.json()['choices'][0]['message']['content']
+    except Exception:
+        return None
 
-# METHOD 3: Graceful Loading Placeholder
-with st.spinner(f"Connecting to {target_pair} Live Feed..."):
-    data = get_live_market_data(target_pair)
+# --- 4. MAIN INTERFACE ---
+current_pair = PAIRS[st.session_state.pair_index]
+market_data = fetch_market_data(current_pair)
 
-# Check if market is moving or "flat" (prevents NaN errors)
-if data is not None and len(data) > 2:
-    volat = data['c'].pct_change().std()
-    is_stable = (not np.isnan(volat)) and (volat < 0.0020)
-else:
-    is_stable = False
-
-# Auto-Shift Logic: If data fails or market is messy, jump after 30s
-elapsed = time.time() - st.session_state.last_shift
-if (data is None or not is_stable) and elapsed >= 30:
+# Automatically switch pairs if data is missing or unstable
+if market_data is None and (time.time() - st.session_state.last_shift >= 30):
     st.session_state.pair_index = (st.session_state.pair_index + 1) % len(PAIRS)
     st.session_state.last_shift = time.time()
     st.rerun()
 
-# --- 4. THE INTERFACE ---
-st.title(f"🏛️ Live Terminal: {target_pair}")
-
-# Split screen for Mobile
-tab1, tab2 = st.tabs(["📊 Live Chart", "💎 Elite Signals"])
+st.title(f"🏛️ Live Terminal: {current_pair}")
+tab1, tab2 = st.tabs(["📊 Live Chart", "💎 Trade Signals"])
 
 with tab1:
-    if data is not None:
-        # Create a high-contrast chart for phone screens
+    if market_data is not None:
         fig = go.Figure(data=[go.Candlestick(
-            x=data['time'], open=data['o'], high=data['h'], low=data['l'], close=data['c'],
+            x=market_data['time'], open=market_data['o'], high=market_data['h'], 
+            low=market_data['l'], close=market_data['c'],
             increasing_line_color='#00FFCC', decreasing_line_color='#FF3366'
         )])
-        fig.update_layout(
-            height=500,
-            template="plotly_dark",
-            xaxis_rangeslider_visible=False,
-            margin=dict(l=0, r=0, t=0, b=0),
-            yaxis=dict(side="right") # Price on the right like trading apps
-        )
-        st.plotly_chart(fig, use_container_width=True, config={'displayModeBar': False})
-        
-        if not is_stable:
-            st.warning(f"Market Volatile. Scanning next pair in {int(30-elapsed)}s...")
+        fig.update_layout(height=500, template="plotly_dark", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
     else:
-        st.error("Connection Error. Checking Binance servers...")
+        st.warning(f"Searching for stable {current_pair} connection...")
 
 with tab2:
-    # Run AI Prediction only if we have good data
-    if is_stable and data is not None:
-        try:
-            last_p = data['c'].iloc[-1]
-            headers = {"Authorization": f"Bearer {NV_KEY}", "Content-Type": "application/json"}
-            payload = {
-                "model": "meta/llama-3.1-70b-instruct",
-                "messages": [{"role": "user", "content": f"Pair {target_pair} at {last_p}. Predict next 60s. Use pattern analysis. If 90% sure say SIGNAL: CALL or PUT."}],
-                "temperature": 0.1
-            }
-            r = requests.post("https://integrate.api.nvidia.com/v1/chat/completions", headers=headers, json=payload, timeout=7)
-            ans = r.json()['choices'][0]['message']['content']
-            
-            if "SIGNAL" in ans:
-                sig_entry = {"time": datetime.now().strftime("%H:%M:%S"), "body": ans}
-                if not st.session_state.signals or st.session_state.signals[0]['body'] != ans:
-                    st.session_state.signals.insert(0, sig_entry)
-        except:
-            st.write("AI is analyzing...")
-
-    if not st.session_state.signals:
-        st.info("Waiting for institutional pattern confirmation...")
+    if market_data is not None:
+        prediction = get_prediction(market_data, current_pair)
+        if prediction and "SIGNAL" in prediction:
+            signal_data = {"time": datetime.now().strftime("%H:%M:%S"), "content": prediction}
+            if not st.session_state.signals or st.session_state.signals[0]['content'] != prediction:
+                st.session_state.signals.insert(0, signal_data)
     
-    for s in st.session_state.signals[:5]:
-        with st.expander(f"🔔 Signal Alert | {s['time']}", expanded=True):
-            st.write(s['body'])
-        
+    if not st.session_state.signals:
+        st.info("Analyzing market patterns...")
+    else:
+        for signal in st.session_state.signals[:5]:
+            with st.expander(f"🔔 Trade Alert | {signal['time']}", expanded=True):
+                st.write(signal['content'])
